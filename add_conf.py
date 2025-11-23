@@ -1,138 +1,104 @@
 """
-ThinkPRM Confidence Score Generation Script (SGLang Ver.)
-
-thinkprm_data.json의 각 검증 스텝에 confidence score를 추가하여
-thinkprm_data_conf.json을 생성합니다.
-
-사용법:
-1. 터미널 1에서 SGLang 서버 실행:
-   conda activate thinkprm
-   export LD_LIBRARY_PATH=~/fake_cuda/lib64:$LD_LIBRARY_PATH
-   export LIBRARY_PATH=~/fake_cuda/lib64:$LIBRARY_PATH
-   python -m sglang.launch_server --model-path "KirillR/QwQ-32B-Preview-AWQ" --port 31111 --host 127.0.0.1 --disable-radix-cache
-
-2. 터미널 2에서 이 스크립트 실행:
-   conda activate thinkprm
-   python add_conf.py
+ThinkPRM Confidence Score Generation Script (Final Fixed Prompt Ver.)
+- Terminal: Shows ONLY progress bar (tqdm)
+- Log File: Records EVERYTHING (Detailed samples, prompt, parsing results)
+- Prompt: RESTORED to original requested version (Exact Match)
 """
 
 import json
 import os
 import sys
 import re
+import traceback
+import argparse
 from transformers import AutoTokenizer
 from sglang import function, gen, set_default_backend, RuntimeEndpoint
 from tqdm import tqdm
-import traceback
 
 # ============================================================================
-# 설정
+# [기본 설정값]
 # ============================================================================
-SGLANG_ENDPOINT = "http://127.0.0.1:31111"
-MODEL_NAME_OR_PATH = "KirillR/QwQ-32B-Preview-AWQ"
-N_SAMPLES_PER_STEP = 10  
-MAX_GENERATION_TOKENS = 4096
-INPUT_FILENAME = "thinkprm_data.json"
-OUTPUT_FILENAME = "thinkprm_data_conf.json"
-DEBUG_LOG_FILENAME = "add_conf_debug.log"
+DEFAULT_SGLANG_ENDPOINT = "http://127.0.0.1:31111"
+DEFAULT_MODEL_PATH = "KirillR/QwQ-32B-Preview-AWQ"
+DEFAULT_N_SAMPLES = 10
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_INPUT_FILE = "thinkprm_data.json"
+DEFAULT_OUTPUT_FILE = "thinkprm_data_conf.json"
+DEFAULT_LOG_FILE = "add_conf_debug.log"
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_SAVE_INTERVAL = 10
+
+# 전역 변수 (args로 덮어씌워짐)
+SGLANG_ENDPOINT = DEFAULT_SGLANG_ENDPOINT
+MODEL_NAME_OR_PATH = DEFAULT_MODEL_PATH
+N_SAMPLES_PER_STEP = DEFAULT_N_SAMPLES
+MAX_GENERATION_TOKENS = DEFAULT_MAX_TOKENS
+TEMPERATURE = DEFAULT_TEMPERATURE
+DEBUG_LOG_FILENAME = DEFAULT_LOG_FILE
 
 # ============================================================================
 # 로깅 함수
 # ============================================================================
-
 log_file = None
 
-def log(message):
-    """콘솔과 파일에 동시 출력"""
-    print(message)
+def log(message, console=False):
+    """
+    console=False: 파일에만 기록 (tqdm 진행바 보호)
+    console=True: 파일+콘솔 둘 다 출력 (에러, 시작 메시지 등)
+    """
+    if console:
+        print(message)
+    
     if log_file:
-        log_file.write(message + "\n")
+        log_file.write(str(message) + "\n")
         log_file.flush()
 
 # ============================================================================
 # 유틸리티 함수
 # ============================================================================
-
 def is_verification_chunk(chunk):
-    """검증 청크인지 확인 (Step k:로 시작하고 \\boxed{}로 끝나는지)"""
     chunk = chunk.strip()
-    if not chunk.startswith("Step"):
-        return False
-    if "\\boxed{" not in chunk:
-        return False
+    if not chunk.startswith("Step"): return False
+    if "\\boxed{" not in chunk: return False
     return True
 
 def get_cot_prefix_before_step(cot_chunks, step_index):
-    """
-    step_index번째 검증 청크 직전까지의 모든 내용을 반환
-    (모델이 이미 생성한 것처럼 인식하도록)
-    
-    Args:
-        cot_chunks: 전체 cot_chunks 리스트
-        step_index: 검증하려는 스텝의 인덱스 (0-based)
-    
-    Returns:
-        step_index 직전까지의 모든 청크를 연결한 문자열
-    """
     prefix_chunks = []
     verification_count = 0
-    
     for chunk in cot_chunks[1:]:
         if is_verification_chunk(chunk):
-            if verification_count == step_index:
-                # 목표 검증 청크에 도달하면 중단
-                break
+            if verification_count == step_index: break
             verification_count += 1
         prefix_chunks.append(chunk)
-    
     return ''.join(prefix_chunks)
 
 def extract_step_verification(text, step_number):
-    """
-    생성된 텍스트에서 특정 스텝의 검증 부분만 추출
-    
-    Args:
-        text: 생성된 전체 텍스트
-        step_number: 추출할 스텝 번호 (1-based)
-    
-    Returns:
-        해당 스텝의 검증 텍스트와 라벨 (1: correct, 0: incorrect, None: 파싱 실패)
-    """
-    # Step N: 패턴 찾기
+    # Step N: ... \boxed{correct} 형식 찾기
     pattern = rf'Step {step_number}:.*?\\boxed\{{(correct|incorrect)\}}'
     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-    
     if match:
-        full_text = match.group(0)
-        label = match.group(1).lower()
-        return full_text, (1 if label == "correct" else 0)
+        return match.group(0), (1 if match.group(1).lower() == "correct" else 0)
     
-    # 만약 Step N: 형식이 없다면 처음 나오는 boxed만 찾기
+    # 만약 형식이 깨져서 \boxed{correct}만 있는 경우
     pattern = r'\\boxed\{(correct|incorrect)\}'
     match = re.search(pattern, text, re.IGNORECASE)
     if match:
-        label = match.group(1).lower()
-        return text, (1 if label == "correct" else 0)
-    
+        return text, (1 if match.group(1).lower() == "correct" else 0)
     return None, None
 
 def create_stop_sequence_after_boxed(text):
-    """
-    \\boxed{correct} 또는 \\boxed{incorrect} 다음에서 자를 수 있도록
-    텍스트를 처리
-    """
     pattern = r'(\\boxed\{(?:correct|incorrect)\})'
     match = re.search(pattern, text, re.IGNORECASE)
     if match:
-        end_pos = match.end()
-        return text[:end_pos]
+        return text[:match.end()]
     return text
 
+# ⭐️ [수정됨] 요청하신 프롬프트 원본 그대로 적용
 def format_verification_prompt(problem, prefix, step_idx, cot_prefix):
     """
     SGLang에 맞는 프롬프트 생성 (항상 9개의 Few-shot 예시 포함)
     """
-    
+   
     # 기본 사용자 컨텐츠
     user_content = f"""Problem:
 {problem}
@@ -239,146 +205,125 @@ Step 1: 2a + 3a = 5a. Critique: Combining like terms 2a and 3a results in 5a. Th
 
     # 프롬프트 조합 (항상 Few-shot 예시 포함)
     full_prompt = user_content + "\n\n" + few_shot_examples + "\n\n" + "Your answer:" + "\n\n" + cot_prefix
-    
+   
     return full_prompt
 
 def print_full_prompt(prompt, step_num):
-    """
-    전체 프롬프트 내용을 출력
-    
-    Args:
-        prompt: 프롬프트 문자열
-        step_num: 현재 스텝 번호
-    """
-    log(f"\n{'='*80}")
-    log(f"PROMPT DETAILS - Step {step_num}")
-    log(f"{'='*80}")
-    log(prompt)
-    log(f"\n{'='*80}\n")
+    log(f"\n{'='*80}\nPROMPT DETAILS - Step {step_num}\n{'='*80}\n{prompt}\n{'='*80}\n")
 
 # ============================================================================
 # SGLang 생성 함수
 # ============================================================================
-
 prompt_to_states = {}
 
-# ⭐️ [수정됨] .run_batch()를 사용하도록 함수 로직 변경
-# .run()처럼 state를 반환하는 대신, .run_batch()가 global dict에 저장하도록 함
 @function
 def generate_step_verification(s, prompt: str, num_samples: int):
-    """
-    SGLang를 사용하여 n개의 검증 생성 (stop 없이)
-    .run_batch()용으로 수정됨:
-    - forks를 반환하는 대신, global dict 'prompt_to_states'에 state를 저장
-    """
-    
-    stop_patterns = [
-        "The evaluation for this step ends here.",
-    ]
-    
+    stop_patterns = ["The evaluation for this step ends here."]
     s += prompt
-    
     forks = s.fork(num_samples)
-    
-    # .run_batch() 스타일:
-    # 1. 단일 이름으로 gen()을 호출
-    # 2. state를 global dict에 저장
     for fork in forks:
         fork += gen(
-            "verification_output",  # ⭐️ 단일 변수 이름 사용
+            "verification_output",
             max_tokens=MAX_GENERATION_TOKENS,
-            temperature=1.0,
-            stop = stop_patterns,
-            #top_p=1.0,
-            #regex=r"Step\s+\d+:\s.*?Critique:\s.*?The step is \\boxed\{(correct|incorrect)\}"
+            temperature=TEMPERATURE,
+            stop=stop_patterns,
         )
-        
-        # ⭐️ [추가] SGLang이 이 state를 global dict에 저장하도록 함
-        # (이 코드는 SGLang 백엔드에서 실행됨)
         if prompt not in prompt_to_states:
             prompt_to_states[prompt] = []
         prompt_to_states[prompt].append(fork)
-    
-    # ⭐️ .run_batch()는 반환값이 필요 없음 (None 반환)
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="ThinkPRM Confidence Generation")
+    parser.add_argument("--endpoint", type=str, default=DEFAULT_SGLANG_ENDPOINT)
+    parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--n-samples", type=int, default=DEFAULT_N_SAMPLES)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--input", type=str, default=DEFAULT_INPUT_FILE)
+    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_FILE)
+    parser.add_argument("--log-file", type=str, default=DEFAULT_LOG_FILE)
+    parser.add_argument("--save-interval", type=int, default=DEFAULT_SAVE_INTERVAL)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=-1)
+    return parser.parse_args()
 
 # ============================================================================
 # 메인 함수
 # ============================================================================
-
 def main():
-    global log_file
+    global log_file, SGLANG_ENDPOINT, MODEL_NAME_OR_PATH, N_SAMPLES_PER_STEP
+    global MAX_GENERATION_TOKENS, TEMPERATURE, DEBUG_LOG_FILENAME, OUTPUT_FILENAME
+
+    args = parse_arguments()
     
-    # 로그 파일 열기
-    log_file = open(DEBUG_LOG_FILENAME, 'w', encoding='utf-8')
+    # 자동 파일명 생성
+    if args.output == DEFAULT_OUTPUT_FILE and (args.start != 0 or args.end != -1):
+        base_name, ext = os.path.splitext(DEFAULT_OUTPUT_FILE)
+        end_str = args.end if args.end != -1 else "end"
+        args.output = f"{base_name}_{args.start}_{end_str}{ext}"
     
-    log("=" * 70)
-    log("ThinkPRM Confidence Score Generation (SGLang Ver.)")
-    log("=" * 70)
+    SGLANG_ENDPOINT = args.endpoint
+    MODEL_NAME_OR_PATH = args.model_path
+    N_SAMPLES_PER_STEP = args.n_samples
+    MAX_GENERATION_TOKENS = args.max_tokens
+    TEMPERATURE = args.temperature
+    DEBUG_LOG_FILENAME = args.log_file
+    OUTPUT_FILENAME = args.output
     
-    # 1. SGLang 서버 연결
-    log(f"\n[1/5] SGLang 서버 연결 중...")
-    log(f"     Endpoint: {SGLANG_ENDPOINT}")
+    log_file = open(DEBUG_LOG_FILENAME, 'a', encoding='utf-8')
     
+    # 시작 정보는 콘솔에도 출력
+    log("=" * 70, console=True)
+    log(f"ThinkPRM Confidence Generation (Started)", console=True)
+    log("=" * 70, console=True)
+    log(f" - Range: {args.start} ~ {'EOF' if args.end == -1 else args.end}", console=True)
+    log(f" - Output: {OUTPUT_FILENAME}", console=True)
+    log(f" - Log File: {DEBUG_LOG_FILENAME} (Details here)", console=True)
+
     try:
         set_default_backend(RuntimeEndpoint(SGLANG_ENDPOINT))
-        log(f"     ✓ 연결 성공")
+        log("✓ SGLang 서버 연결 성공", console=True)
     except Exception as e:
-        log(f"     ❌ 연결 실패: {e}")
-        log(f"\n서버를 먼저 실행하세요:")
-        log(f"conda activate thinkprm")
-        log(f"export LD_LIBRARY_PATH=~/fake_cuda/lib64:$LD_LIBRARY_PATH")
-        log(f"export LIBRARY_PATH=~/fake_cuda/lib64:$LIBRARY_PATH")
-        log(f'python -m sglang.launch_server --model-path "{MODEL_NAME_OR_PATH}" --port 31111 --host 127.0.0.1 --disable-radix-cache')
-        log_file.close()
+        log(f"❌ 서버 연결 실패: {e}", console=True)
         return 1
 
-    # 2. 토크나이저 로드
-    log(f"\n[2/5] 토크나이저 로드 중...")
-    log(f"     Model: {MODEL_NAME_OR_PATH}")
-    
     try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH)
-        log(f"     ✓ 로드 성공")
+        with open(args.input, 'r', encoding='utf-8') as f:
+            full_data = json.load(f)
+            
+        end_idx = args.end if args.end != -1 else len(full_data)
+        result_data = []
+        processed_count = 0
+        
+        if os.path.exists(OUTPUT_FILENAME):
+            try:
+                with open(OUTPUT_FILENAME, 'r', encoding='utf-8') as f:
+                    result_data = json.load(f)
+                processed_count = len(result_data)
+                log(f"🔄 기존 작업 파일 로드: {processed_count}개 완료됨", console=True)
+            except:
+                result_data = []
+
+        real_start_idx = args.start + processed_count
+        
+        if real_start_idx >= end_idx:
+            log("✅ 이미 완료된 작업입니다.", console=True)
+            return 0
+        
+        target_data = full_data[real_start_idx : end_idx]
+        log(f"🚀 작업 시작: {len(target_data)}개 문제 처리 중...\n", console=True)
+        
     except Exception as e:
-        log(f"     ❌ 로드 실패: {e}")
-        log_file.close()
+        log(f"❌ 데이터 준비 실패: {e}", console=True)
         return 1
 
-    # 3. 입력 데이터 로드
-    log(f"\n[3/5] 입력 데이터 로드 중...")
-    log(f"     파일: {INPUT_FILENAME}")
-    
-    try:
-        with open(INPUT_FILENAME, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+    # 메인 루프
+    for i, item in enumerate(tqdm(target_data, desc="Processing", initial=processed_count, total=end_idx - args.start)):
+        current_idx = real_start_idx + i
         
-        data = data[:]  # 테스트용 제한
-        
-        log(f"     ✓ 로드 성공: {len(data):,}개 문제")
-        
-        total_steps_to_verify = sum(item['valid_prefix_step_count'] for item in data)
-        # ⭐️ .run_batch()를 사용하므로 API 호출 횟수가 스텝 수와 같음
-        total_api_calls = total_steps_to_verify
-        log(f"     - 검증할 총 스텝 수: {total_steps_to_verify:,}개")
-        log(f"     - 예상 SGLang 호출 횟수: {total_api_calls:,}회 (호출당 {N_SAMPLES_PER_STEP}개 샘플)")
-        
-    except Exception as e:
-        log(f"     ❌ 로드 실패: {e}")
-        log_file.close()
-        return 1
-
-    # 4. Confidence Score 생성
-    log(f"\n[4/5] Confidence Score 생성 중...")
-    log(f"     - 문제 수: {len(data)}")
-    log(f"     - 스텝당 샘플링 횟수: {N_SAMPLES_PER_STEP}")
-    log(f"     - Temperature: 1.4")
-    log(f"     - Top-p: 0.9\n")
-    
-    result_data = []
-    total_steps_processed = 0
-    n_skipped = 0
-    
-    for problem_idx, item in enumerate(tqdm(data, desc="문제 처리 중")):
         try:
             problem = item['problem']
             prefix = item['prefix']
@@ -386,197 +331,84 @@ def main():
             gt_step_labels = item['gt_step_labels']
             valid_prefix_step_count = item['valid_prefix_step_count']
             
-            log(f"\n{'=' * 70}")
-            log(f"문제 {problem_idx}")
-            log(f"{'=' * 70}")
-            log(f"문제 텍스트:\n{problem}")
-            log(f"\nvalid_prefix_step_count: {valid_prefix_step_count}")
-            log(f"gt_step_labels: {gt_step_labels}")
-            
-            # 업데이트할 cot_chunks 복사
             updated_cot_chunks = cot_chunks.copy()
             
-            # valid_prefix_step_count만큼만 처리
+            log(f"\n\n{'='*30} Problem {current_idx} {'='*30}")
+            
             for step_idx in range(valid_prefix_step_count):
-                log(f"\n{'-' * 70}")
-                log(f"Step {step_idx + 1} 처리 시작")
-                log(f"{'-' * 70}")
-                
-                # 해당 스텝 직전까지의 CoT 프리픽스 생성
                 cot_prefix = get_cot_prefix_before_step(cot_chunks, step_idx)
-                
-                log(f"\nCoT Prefix 길이: {len(cot_prefix)} 문자")
-                log(f"CoT Prefix 내용:")
-                log(f"{cot_prefix}")
-                
-                # 프롬프트 생성
-                prompt = format_verification_prompt(
-                    problem=problem,
-                    prefix=prefix,
-                    step_idx=step_idx,
-                    cot_prefix=cot_prefix
-                )
-                
-                log(f"\n프롬프트 생성 완료\n")
-                
-                # 스텝별로 한 번만 프롬프트 출력
+                prompt = format_verification_prompt(problem, prefix, step_idx, cot_prefix)
                 current_step_number = step_idx + 1
-                print_full_prompt(prompt, current_step_number)
                 
-                # prompt_to_states 초기화
+                print_full_prompt(prompt, current_step_number) # 파일에만 기록됨
+                
                 global prompt_to_states
                 prompt_to_states = {}
+                batch_args = [{'prompt': prompt, 'num_samples': N_SAMPLES_PER_STEP}]
                 
-                # N_SAMPLES_PER_STEP번 생성 (병렬)
-                log(f"생성 시작 (총 {N_SAMPLES_PER_STEP}개 병렬 생성)...\n")
-                
-                generated_verifications = []
                 try:
-                    # ⭐️ [수정됨] .run() 대신 .run_batch() 사용
-                    log("DEBUG: .run_batch() 호출 시도 중...")
-                    batch_args = [{'prompt': prompt, 'num_samples': N_SAMPLES_PER_STEP}]
-                    # .run_batch()는 비동기이며, SGLang 함수 내부에서 'prompt_to_states'에 저장함
                     _ = generate_step_verification.run_batch(batch_args)
-                    log("DEBUG: .run_batch() 호출 성공.")
-
-                    # ⭐️ [수정됨] global dict에서 결과 수집
-                    if prompt not in prompt_to_states:
-                        # SGLang 서버에서 작업은 했으나, 0개의 state가 반환된 경우
-                        log(f"     ❌ SGLang이 프롬프트에 대해 생성을 못했습니다. (KeyError)")
-                        raise KeyError(f"SGLang이 프롬프트에 대해 생성을 못했습니다.")
-
-                    # ⭐️ [수정됨] state 리스트에서 결과 추출
-                    states = prompt_to_states[prompt] # state 리스트
-                    log(f"DEBUG: {len(states)}개 state 수신 완료.")
-
-                    for i, state in enumerate(states):
-                        # ⭐️ SGLang 함수에서 정의한 "verification_output" 사용
-                        generated_text = state["verification_output"]
-                        
-                        # \boxed{} 이후 텍스트 제거
-                        generated_text = create_stop_sequence_after_boxed(generated_text)
-                        
-                        log(f"\n     [샘플 {i + 1} 생성 결과]")
-                        log(f"     {generated_text}")
-                        
-                        generated_verifications.append(generated_text)
-                
+                    if prompt not in prompt_to_states: raise KeyError("No Output")
+                    states = prompt_to_states[prompt]
+                    generated_verifications = [create_stop_sequence_after_boxed(s["verification_output"]) for s in states]
                 except Exception as gen_err:
-                    log(f"     ❌ 생성 중 오류 발생: {gen_err}")
-                    log(traceback.format_exc()) # <--- 상세 트레이스백 추가
-                    log("DEBUG: .run_batch() 호출 중 예외 발생.")
-                    generated_verifications = [] # 다음 단계로 넘어가지 않도록 비움
-                
-                log(f"\n총 {len(generated_verifications)}/{N_SAMPLES_PER_STEP}개 샘플 수집 완료.")
-                
-                # GT 라벨과 비교
+                    log(f"❌ Generation Error: {gen_err}")
+                    generated_verifications = []
+
+                # 상세 파싱 결과 로그 기록
                 gt_label = gt_step_labels[step_idx]
                 gt_numeric = 1 if gt_label == '+' else 0
                 
-                log(f"GT 라벨: {gt_label} ({gt_numeric})\n")
-                
-                # 각 생성 결과에서 현재 스텝의 검증 부분만 추출
                 predicted_labels = []
-                for i, gen_text in enumerate(generated_verifications):
+                
+                log(f"\n--- Step {current_step_number} Generation Results ({len(generated_verifications)} samples) ---")
+                
+                for s_i, gen_text in enumerate(generated_verifications):
                     step_verification, pred_label = extract_step_verification(gen_text, current_step_number)
-                    
-                    if step_verification:
-                        log(f"\n[샘플 {i+1}] 추출된 Step {current_step_number} 검증:")
-                        log(f"{step_verification}")
-                    
                     predicted_labels.append(pred_label)
-                    log(f"추출된 라벨: {pred_label} ({'correct' if pred_label == 1 else 'incorrect' if pred_label == 0 else 'PARSE_FAILED'})")
+                    
+                    # 상세 내용을 파일에 기록
+                    log(f"\n[Sample {s_i+1}]")
+                    log(f"Generated: {gen_text.strip()}")
+                    label_str = 'Correct' if pred_label == 1 else 'Incorrect' if pred_label == 0 else 'FAIL(None)'
+                    log(f"Extracted: {label_str} ({pred_label})")
+
+                matches = sum(1 for pred in predicted_labels if pred == gt_numeric)
+                confidence = matches / N_SAMPLES_PER_STEP
                 
-                # Confidence 계산
-                valid_predictions = [p for p in predicted_labels if p is not None]
-                
-                log(f"\n{'=' * 70}")
-                log(f"=== 결과 분석 ===")
-                log(f"{'=' * 70}")
-                
-                if len(valid_predictions) > 0:
-                    matches = sum(1 for pred in valid_predictions if pred == gt_numeric)
-                    confidence = matches / len(valid_predictions)
-                    log(f"총 생성: {len(predicted_labels)}개")
-                    log(f"파싱 성공: {len(valid_predictions)}개")
-                    log(f"GT와 일치: {matches}개")
-                    log(f"Confidence: {confidence:.2f}")
-                else:
-                    confidence = 0.0
-                    log(f"⚠️ 파싱 성공한 예측 없음!")
-                
-                # 해당 검증 청크에 confidence 태그 추가
+                # 요약 정보 기록
+                parsed_cnt = sum(1 for p in predicted_labels if p is not None)
+                log(f"\n[Step {current_step_number} Summary]")
+                log(f"GT: {gt_label} | Parsed: {parsed_cnt}/{N_SAMPLES_PER_STEP} | Match: {matches} | Conf: {confidence:.2f}")
+
                 verification_count = 0
-                chunk_found = False
-                for chunk_idx, chunk in enumerate(updated_cot_chunks):
+                for c_idx, chunk in enumerate(updated_cot_chunks):
                     if is_verification_chunk(chunk):
                         if verification_count == step_idx:
-                            log(f"\n검증 청크 찾음 (cot_chunks 인덱스: {chunk_idx})")
-                            log(f"원본 청크:")
-                            log(f"{chunk}")
-                            updated_cot_chunks[chunk_idx] = chunk + f"<confidence>{confidence:.2f}</confidence>"
-                            log(f"\n업데이트된 청크:")
-                            log(f"{updated_cot_chunks[chunk_idx]}")
-                            chunk_found = True
+                            updated_cot_chunks[c_idx] = chunk + f"<confidence>{confidence:.2f}</confidence>"
                             break
                         verification_count += 1
-                
-                if not chunk_found:
-                    log(f"\n⚠️ 검증 청크를 찾을 수 없음!")
-                
-                total_steps_processed += 1
-                log(f"\nStep {step_idx + 1} 처리 완료!\n")
             
-            # 업데이트된 데이터 저장
             updated_item = item.copy()
             updated_item['cot_chunks'] = updated_cot_chunks
             updated_item['cot'] = ''.join(updated_cot_chunks)
             result_data.append(updated_item)
             
-            log(f"\n{'=' * 70}")
-            log(f"문제 {problem_idx} 처리 완료!")
-            log(f"{'=' * 70}\n")
-            
         except Exception as e:
-            log(f"\n⚠️  문제 {problem_idx} 처리 중 오류 발생: {e}")
+            log(f"⚠️ Problem {current_idx} Error: {e}")
             log(traceback.format_exc())
             result_data.append(item)
-            n_skipped += 1
-            continue
-    
-    # 5. 결과 저장
-    log(f"\n[5/5] 결과 저장 중...")
-    
-    if not result_data:
-        log("     ❌ 생성된 데이터가 없습니다.")
-        log_file.close()
-        return 1
-    
-    try:
-        with open(OUTPUT_FILENAME, 'w', encoding='utf-8') as f:
-            json.dump(result_data, f, indent=2, ensure_ascii=False)
-        
-        log(f"     ✓ 저장 완료: {OUTPUT_FILENAME}")
-        log("\n" + "=" * 70)
-        log("생성 완료!")
-        log("=" * 70)
-        log(f"처리된 문제 수:      {len(result_data):,}개")
-        log(f"건너뛴 문제 수:      {n_skipped:,}개")
-        log(f"처리된 스텝 수:      {total_steps_processed:,}개")
-        log("=" * 70)
-        log(f"\n디버그 로그: {DEBUG_LOG_FILENAME}")
-        
-        log_file.close()
-        return 0
-        
-    except Exception as e:
-        log(f"     ❌ 저장 실패: {e}")
-        log(traceback.format_exc())
-        log_file.close()
-        return 1
+            
+        if (len(result_data) % args.save_interval == 0) or (i == len(target_data) - 1):
+            log(f"💾 Checkpoint saved... ({len(result_data)} items)")
+            try:
+                with open(OUTPUT_FILENAME, 'w', encoding='utf-8') as f:
+                    json.dump(result_data, f, indent=2, ensure_ascii=False)
+            except Exception as save_err:
+                log(f"❌ Save Error: {save_err}", console=True)
+
+    log("✅ 모든 작업 완료.", console=True)
+    return 0
 
 if __name__ == "__main__":
-    exit_code = main()
-    
-    print("정리 중...")
-    os._exit(exit_code)
+    sys.exit(main())
