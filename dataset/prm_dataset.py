@@ -222,7 +222,7 @@ class PRMCoTDataset(PRMTrajectoryDataset):
         for example in data:
             problem = example['problem']
             prefix = example['prefix']
-            gt_labels = example['traj_gt_labels'] # list of '+' or '-'
+            gt_labels = example['gt_step_labels'] # list of '+' or '-'
             gt_labels = ['+' if lbl in ['+', 1] else '-' for lbl in gt_labels]
             gt_labels = self.fix_step_labels(gt_labels)
             gold_traj = [l for l in example['prompt'].split('\n') if l.startswith('Correct solution')][-1].replace('Correct solution:', '').strip()
@@ -235,9 +235,9 @@ class PRMCoTDataset(PRMTrajectoryDataset):
             is_correct = gt_labels[-1] == '+'
             n_trajs_so_far = 0
             
-            example['generations'] = list(set(example['generations'])) # remove duplicates if any
+            #example['generations'] = list(set(example['generations'])) # remove duplicates if any
 
-            for generation in example['generations']:
+            for generation in [example['cot']]:
                 # Extract the final decision from the generation
                 n_total += 1
                 decisions = [s for s in generation.split('\n') if 'correct? yes' in s.lower() or 'correct? no' in s.lower()]
@@ -472,215 +472,30 @@ class PRMCoTDataset(PRMTrajectoryDataset):
 
 
 class LongThoughtCritiqueDataset(PRMCoTDataset):
-    def __init__(self, 
-                 data_path: str, 
-                 tokenizer, 
-                 config=None, 
-                 split='train'):
-        self.predecision_string = 'Is the solution correct?'
-        if hasattr(config, 'add_think_token'):
-            self.add_think_token = config.add_think_token
-        else:
-            self.add_think_token = '<think>' in tokenizer.vocab
-            
-        print(f"Adding think 🤔 token? {self.add_think_token}")
-        super().__init__(data_path=data_path, tokenizer=tokenizer, config=config, split=split)
-
-    def extract_boxed_predictions(self, solution_text: str):
-        solution_text = re.sub(r'\\text\{([^}]*)\}', r'\1', solution_text)
-        matches = re.findall(r'\\boxed\{([^}]*)\}', solution_text)
-        return [match.strip() for match in matches if match in ['correct', 'incorrect']]
-        
     def process_data(self, data):
         processed_data = []
-        n_skipped_bad_format = 0
-        n_skipped_bad_decisions = 0
-        n_skipped_bad_length = 0
-        n_total = 0
-        max_cots_per_solution = self.config.max_cots_per_solution
-        match_all = getattr(self.config, 'match_all_step_labels', True)
         
         for example in data:
-            problem = example['problem']
-            prefix = example['prefix']
-            steps = prefix.split('\n')
-            
-            gt_labels = example['traj_gt_labels']
-            gt_labels = ['+' if lbl in ['+', 1] else '-' for lbl in gt_labels]
-            gt_labels = self.fix_step_labels(gt_labels)
-            
-            if not gt_labels:
+            if not example.get('gt_step_labels'):
                 continue
-
-            labels_until_error = gt_labels[:gt_labels.index('-') + 1] if '-' in gt_labels else gt_labels
-            is_correct = gt_labels[-1] == '+'
-            n_trajs_so_far = 0
             
-            for generation in example['generations']:
-                n_total += 1
-                decisions = self.extract_boxed_predictions(generation)
-                decisions = ['+' if d == 'correct' else '-' for d in decisions]
-                
-                if not decisions:
-                    n_skipped_bad_format += 1
-                    continue
-                
-                if len(decisions) != len(labels_until_error) and len(decisions) != len(steps):
-                    n_skipped_bad_format += 1
-                    continue
-               
-                if not match_all:
-                    # Looser filtering - only compare final decisions
-                    if decisions[-1] != gt_labels[-1] or 'The answer is' not in generation: # outcome-based, so we need the outcome i.e., answer to be there
-                        n_skipped_bad_decisions += 1
-                        continue
-                
-                elif not all(decision == gt_label for decision, gt_label in zip(decisions, labels_until_error)): # stricter filtering based on process labels (used in the paper)
-                        n_skipped_bad_decisions += 1
-                        continue
-                    
-                if n_trajs_so_far > max_cots_per_solution:
-                    break
-                                    
-                # Clean the generation
-                generation = generation.replace('\\boxed{\\text{correct}}', '\\boxed{correct}').replace('\\boxed{\\text{incorrect}}', '\\boxed{incorrect}')
-                
-                # Clean text after the last decision
-                last_boxed_index = -1
-                for match in re.finditer(r'\\boxed\{[^}]*\}', generation):
-                    boxed_content = match.group(0)
-                    if any(decision in boxed_content.lower() for decision in ['correct', 'incorrect']):
-                        last_boxed_index = match.end()
-                
-                if last_boxed_index != -1:
-                    generation = generation[:last_boxed_index]
-                    
-                if '<think>' in generation:
-                    generation = generation[:generation.index('<think>') + len('<think>')]
-                    
-                if '</think>' in generation:
-                    generation = generation[:generation.index('</think>')]
-                
-                if getattr(self.config, 'filter_based_on_length', False) and len(self.tokenizer(generation, return_tensors='pt')['input_ids'][0]) > self.config.max_length:
-                    n_skipped_bad_length += 1
-                    continue
-                
-                if self.add_think_token:
-                    generation = f"<think>\n{generation}\n</think>"
-                        
-                generation += f"\n{self.predecision_string} {'Yes' if is_correct else 'No'}"
-                                                                
-                processed_data.append({
-                    'problem': problem,
-                    'solution': prefix,
-                    'cot': generation,
-                    'solution_steps': steps,
-                    'cot_steps': generation.split('\n'),
-                    'labels': gt_labels,
-                    'is_correct': is_correct,
-                })
-                
-                # Add partial prefixes if configured
-                if self._should_add_partial_prefix(steps):
-                    partial_example = self._create_partial_prefix_example(steps, generation, gt_labels)
-                    if partial_example:
-                        processed_data.append(partial_example)
-                
-        print(f"Skipped {n_skipped_bad_format}/{n_total} examples due to extraction errors")
-        print(f"Skipped {n_skipped_bad_decisions}/{n_total} examples due to incorrect decisions")
-        print(f"Skipped {n_skipped_bad_length}/{n_total} examples due to length")
-        print(f"Got {len(processed_data)} chains from {len(set([ex['problem'] for ex in processed_data]))} unique questions")
+            steps = example['prefix'].split('\n')
+            gt_labels = ['+' if lbl in ['+', 1] else '-' 
+                        for lbl in example['gt_step_labels']]
+            
+            # 🎯 데이터가 이미 완벽하므로 그대로 사용
+            processed_data.append({
+                'problem': example['problem'],
+                'solution': example['prefix'],
+                'cot': example['cot'],  # 수정 없이!
+                'solution_steps': steps,
+                'cot_steps': example['cot'].split('\n'),
+                'labels': gt_labels,
+                'is_correct': example['prefix_label']
+            })
         
-        # Balance data if configured
-        if self.config.balance_data:
-            processed_data = self._balance_data(processed_data)
-                    
-        # Limit number of samples if configured
-        if getattr(self.config, 'num_samples', None):
-            ## shuffle and take first num_samples
-            random.seed(42)
-            random.shuffle(processed_data)
-            processed_data = processed_data[:self.config.num_samples]
-                                
+        print(f"✅ Loaded {len(processed_data)} training examples")
         return processed_data
-    
-    def _should_add_partial_prefix(self, steps):
-        return (getattr(self.config, 'add_partial_prefixes', False) 
-                and random.random() < 0.1 
-                and len(steps) >= 4)
-    
-    def _create_partial_prefix_example(self, steps, generation, gt_labels):
-        k = random.randint(1, len(steps) - 1)  # Don't cut at the last step
-        partial_prefix = '\n'.join(steps[:k])
-        
-        # Extract all lines containing boxed decisions up to k-th decision
-        cot_lines = []
-        decision_count = 0
-        for line in generation.split('\n'):
-            if decision_count >= k:
-                break
-            cot_lines.append(line)
-            if '\\boxed{' in line and any(d in line.lower() for d in ['correct', 'incorrect']):
-                decision_count += 1
-                
-        if k > decision_count:
-            return None
-                
-        partial_cot = '\n'.join(cot_lines)
-        partial_labels = gt_labels[:k]
-        
-        # Verify decision count matches step count
-        n_decisions = sum(1 for line in partial_cot.split('\n') 
-                          if '\\boxed{' in line and any(d in line.lower() for d in ['correct', 'incorrect']))
-        if n_decisions != k:
-            print(f"Number of decisions ({n_decisions}) does not match the number of steps ({k})")
-        
-        if self.add_think_token:
-            partial_cot = f"<think>\n{partial_cot}\n</think>"
-            
-        # Add final prediction line
-        partial_cot += f"\n{self.predecision_string} {'Yes' if partial_labels[-1] == '+' else 'No'}"
-                                                
-        return {
-            'problem': steps[0],  # First step usually contains the problem
-            'solution': partial_prefix,
-            'cot': partial_cot,
-            'solution_steps': steps[:k],
-            'cot_steps': partial_cot.split('\n'),
-            'labels': partial_labels,
-            'is_correct': partial_labels[-1] == '+',
-        }
-    
-    def _balance_data(self, data):
-        # Separate correct and incorrect examples
-        correct_examples = [ex for ex in data if ex['is_correct']]
-        incorrect_examples = [ex for ex in data if not ex['is_correct']]
-        
-        correct_count = len(correct_examples)
-        incorrect_count = len(incorrect_examples)
-        
-        print(f"Before balancing - Correct examples: {correct_count}, Incorrect examples: {incorrect_count}")
-        
-        # Balance the dataset
-        target_count = min(correct_count, incorrect_count)
-        majority_examples = correct_examples if correct_count > incorrect_count else incorrect_examples
-        minority_examples = incorrect_examples if correct_count > incorrect_count else correct_examples
-        
-        balanced_data = minority_examples + random.sample(majority_examples, target_count)
-        
-        # Report balancing results
-        correct_count = len([ex for ex in balanced_data if ex['is_correct']])
-        incorrect_count = len(balanced_data) - correct_count
-        
-        print(f"After balancing - Correct examples: {correct_count}, Incorrect examples: {incorrect_count}")
-        
-        return balanced_data
-    
-    def format_cot_data(self, problem, solution, cot=None):
-        if '</think>' in cot:
-            return format_train_verification_cot_for_thinkprm(self.tokenizer, problem, solution, cot=cot)
-        else:
-            return format_verification_cot_for_thinkprm(self.tokenizer, problem, solution, cot=cot)
             
 
 class PRMCoTPairwiseDataset(PRMCoTDataset):
@@ -705,7 +520,7 @@ class PRMCoTPairwiseDataset(PRMCoTDataset):
         for example in data:
             problem = example['problem']
             prefix = example['prefix']
-            gt_labels = example['traj_gt_labels'] # list of '+' or '-'
+            gt_labels = example['gt_step_labels'] # list of '+' or '-'
             gt_labels = ['+' if lbl in ['+', 1] else '-' for lbl in gt_labels]
             gt_labels = self.fix_step_labels(gt_labels)
             gold_traj = [l for l in example['prompt'].split('\n') if l.startswith('Correct solution')][-1].replace('Correct solution:', '').strip()
@@ -719,7 +534,7 @@ class PRMCoTPairwiseDataset(PRMCoTDataset):
             chosen_trajs = []
             rejected_trajs = []
 
-            for generation in example['generations']:
+            for generation in [example['cot']]:
                 # Extract the final decision from the generation
                 n_total += 1
                 decisions = [s for s in generation.split('\n') if s.strip() and 'correct?' in s.lower()]
